@@ -1,0 +1,293 @@
+import os
+from datetime import datetime
+from functools import wraps
+
+from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import check_password_hash, generate_password_hash
+import numpy as np
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'crop_yield_secret_2026')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///crop_yield.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+
+db = SQLAlchemy(app)
+
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    full_name = db.Column(db.String(120), nullable=False)
+
+
+class Farm(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    location = db.Column(db.String(200), nullable=False)
+    owner = db.Column(db.String(120), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    fields = db.relationship('Field', backref='farm', lazy=True, cascade='all, delete-orphan')
+
+
+class Field(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    farm_id = db.Column(db.Integer, db.ForeignKey('farm.id'), nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    area_hectares = db.Column(db.Float, nullable=False)
+    crop_type = db.Column(db.String(120), nullable=False)
+    soil_type = db.Column(db.String(120), nullable=True)
+    records = db.relationship('HarvestRecord', backref='field', lazy=True, cascade='all, delete-orphan')
+
+
+class HarvestRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    field_id = db.Column(db.Integer, db.ForeignKey('field.id'), nullable=False)
+    crop_name = db.Column(db.String(120), nullable=False)
+    planting_date = db.Column(db.Date, nullable=False)
+    harvest_date = db.Column(db.Date, nullable=False)
+    area_hectares = db.Column(db.Float, nullable=False)
+    yield_kg = db.Column(db.Float, nullable=False)
+    unit_price = db.Column(db.Float, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password_hash, password):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            flash('Login successful.', 'success')
+            return redirect(url_for('index'))
+
+        flash('Invalid username or password.', 'error')
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('You have been logged out.', 'success')
+    return redirect(url_for('login'))
+
+
+@app.route('/')
+@login_required
+def index():
+    farms = Farm.query.order_by(Farm.created_at.desc()).all()
+    fields = Field.query.order_by(Field.id).all()
+    records = HarvestRecord.query.order_by(HarvestRecord.harvest_date.desc()).all()
+    stats = calculate_yield_stats(records)
+    monthly_data = build_monthly_yield_chart(records)
+    return render_template('index.html', farms=farms, fields=fields, records=records[:8], stats=stats, monthly_data=monthly_data)
+
+
+@app.route('/history')
+@login_required
+def history():
+    records = HarvestRecord.query.order_by(HarvestRecord.harvest_date.desc()).all()
+    stats = calculate_yield_stats(records)
+    return render_template('history.html', records=records, stats=stats)
+
+
+@app.route('/farm', methods=['POST'])
+@login_required
+def add_farm():
+    name = request.form.get('name', '').strip()
+    location = request.form.get('location', '').strip()
+    owner = request.form.get('owner', '').strip()
+
+    if not name or not location or not owner:
+        flash('Please fill all farm details.', 'error')
+        return redirect(url_for('index'))
+
+    db.session.add(Farm(name=name, location=location, owner=owner))
+    db.session.commit()
+    flash('Farm added successfully.', 'success')
+    return redirect(url_for('index'))
+
+
+@app.route('/field', methods=['POST'])
+@login_required
+def add_field():
+    farm_id = request.form.get('farm_id', type=int)
+    name = request.form.get('name', '').strip()
+    area_hectares = request.form.get('area_hectares', type=float)
+    crop_type = request.form.get('crop_type', '').strip()
+    soil_type = request.form.get('soil_type', '').strip()
+
+    if not farm_id or not name or not area_hectares or not crop_type:
+        flash('Please provide valid field information.', 'error')
+        return redirect(url_for('index'))
+
+    db.session.add(Field(farm_id=farm_id, name=name, area_hectares=area_hectares, crop_type=crop_type, soil_type=soil_type))
+    db.session.commit()
+    flash('Field added successfully.', 'success')
+    return redirect(url_for('index'))
+
+
+@app.route('/record', methods=['POST'])
+@login_required
+def add_record():
+    field_id = request.form.get('field_id', type=int)
+    crop_name = request.form.get('crop_name', '').strip()
+    planting_date = request.form.get('planting_date')
+    harvest_date = request.form.get('harvest_date')
+    area_hectares = request.form.get('area_hectares', type=float)
+    yield_kg = request.form.get('yield_kg', type=float)
+    unit_price = request.form.get('unit_price', type=float)
+    notes = request.form.get('notes', '').strip()
+
+    if not field_id or not crop_name or not planting_date or not harvest_date or not area_hectares or not yield_kg:
+        flash('Please complete all required crop yield fields.', 'error')
+        return redirect(url_for('index'))
+
+    db.session.add(HarvestRecord(
+        field_id=field_id,
+        crop_name=crop_name,
+        planting_date=datetime.strptime(planting_date, '%Y-%m-%d').date(),
+        harvest_date=datetime.strptime(harvest_date, '%Y-%m-%d').date(),
+        area_hectares=area_hectares,
+        yield_kg=yield_kg,
+        unit_price=unit_price,
+        notes=notes,
+    ))
+    db.session.commit()
+    flash('Harvest record added successfully.', 'success')
+    return redirect(url_for('index'))
+
+
+@app.route('/delete_record/<int:record_id>', methods=['POST'])
+@login_required
+def delete_record(record_id):
+    record = HarvestRecord.query.get_or_404(record_id)
+    db.session.delete(record)
+    db.session.commit()
+    flash('Record deleted successfully.', 'success')
+    return redirect(url_for('history'))
+
+
+def calculate_yield_stats(records):
+    if not records:
+        return {'total_yield': 0.0, 'average_yield': 0.0, 'highest_yield': 0.0, 'total_revenue': 0.0}
+
+    yields = np.array([record.yield_kg for record in records], dtype=float)
+    revenue = np.array([record.yield_kg * (record.unit_price or 0) for record in records], dtype=float)
+
+    return {
+        'total_yield': float(np.sum(yields)),
+        'average_yield': float(np.mean(yields)),
+        'highest_yield': float(np.max(yields)),
+        'total_revenue': float(np.sum(revenue)),
+    }
+
+
+def build_monthly_yield_chart(records):
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    labels = []
+    values = []
+    now = datetime.utcnow()
+    for month_offset in range(5, -1, -1):
+        month_index = (now.month - month_offset - 1) % 12
+        year = now.year if now.month - month_offset > 0 else now.year - 1
+        month_name = months[month_index]
+        labels.append(f'{month_name} {year}')
+        month_total = 0.0
+        for record in records:
+            if record.harvest_date.year == year and record.harvest_date.month == (month_index + 1):
+                month_total += record.yield_kg
+        values.append(float(month_total))
+    return {'labels': labels, 'values': values}
+
+
+with app.app_context():
+    db.create_all()
+
+    if not User.query.filter_by(username='admin').first():
+        db.session.add(User(
+            username='admin',
+            password_hash=generate_password_hash('admin123'),
+            full_name='Farm Administrator'
+        ))
+        db.session.commit()
+
+    if Farm.query.count() == 0:
+        farm1 = Farm(name='Green Valley Farms', location='Gorakhpur, Uttar Pradesh', owner='Aayush')
+        farm2 = Farm(name='Sunrise Harvest', location='Gorakhpur, Uttar Pradesh', owner='Aayush')
+        db.session.add_all([farm1, farm2])
+        db.session.commit()
+
+        field1 = Field(farm_id=farm1.id, name='North Plot', area_hectares=10.5, crop_type='Wheat', soil_type='Loamy')
+        field2 = Field(farm_id=farm1.id, name='South Plot', area_hectares=8.2, crop_type='Rice', soil_type='Clay')
+        field3 = Field(farm_id=farm2.id, name='Field A', area_hectares=12.0, crop_type='Maize', soil_type='Sandy Loam')
+        db.session.add_all([field1, field2, field3])
+        db.session.commit()
+
+        records = [
+            HarvestRecord(field_id=field1.id, crop_name='Wheat', planting_date=datetime(2025, 11, 1).date(), harvest_date=datetime(2026, 3, 25).date(), area_hectares=10.5, yield_kg=7200, unit_price=18.5, notes='Healthy crop with good irrigation.'),
+            HarvestRecord(field_id=field2.id, crop_name='Rice', planting_date=datetime(2025, 6, 15).date(), harvest_date=datetime(2025, 10, 20).date(), area_hectares=8.2, yield_kg=6100, unit_price=22.0, notes='Good monsoon season.'),
+            HarvestRecord(field_id=field3.id, crop_name='Maize', planting_date=datetime(2025, 7, 3).date(), harvest_date=datetime(2025, 11, 12).date(), area_hectares=12.0, yield_kg=9800, unit_price=16.0, notes='High yield after nutrient management.'),
+            HarvestRecord(field_id=field1.id, crop_name='Wheat', planting_date=datetime(2026, 1, 5).date(), harvest_date=datetime(2026, 5, 10).date(), area_hectares=9.5, yield_kg=8400, unit_price=19.0, notes='Strong overall performance.'),
+        ]
+        db.session.add_all(records)
+        db.session.commit()
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
